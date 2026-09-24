@@ -262,12 +262,18 @@ function extractClaudeScopedWeekly(body) {
 // both mean "the CLI login no longer works", and both are fixed the same way.
 const CLAUDE_AUTH_EXPIRED_MESSAGE = "Claude token expired — run `claude` once to refresh.";
 
+// The usage endpoint throttles by User-Agent: Node's default `node` UA (and any
+// non-Claude-Code UA) gets a 429 on every call, while `claude-code/<any version>` is
+// served normally with the same token.
+const CLAUDE_USAGE_USER_AGENT = "claude-code/2.0.0";
+
 async function fetchClaudeUsageLimits(accessToken, { fetchImpl = fetch, maxAttempts = 3 } = {}) {
   const url = "https://api.anthropic.com/api/oauth/usage";
   const headers = {
     Authorization: `Bearer ${accessToken}`,
     "anthropic-beta": "oauth-2025-04-20",
     Accept: "application/json",
+    "User-Agent": CLAUDE_USAGE_USER_AGENT,
   };
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const res = await fetchImpl(url, { method: "GET", headers });

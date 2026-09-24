@@ -548,14 +548,16 @@ describe("getUsageLimits claude data-age fields (stale + cached_at)", () => {
     try {
       writeClaudeCreds(tmp, "sk-ant-oauth-live");
       const before = Date.now();
+      let observedUserAgent = null;
       const result = await getUsageLimits({
         home: tmp,
         platform: "linux",
         providerTimeoutMs: 2000,
         securityRunner() { return { status: 1, stdout: "" }; },
         commandRunner() { return { status: 1, stdout: "" }; },
-        fetchImpl(url) {
+        fetchImpl(url, options) {
           if (url === CLAUDE_USAGE_URL) {
+            observedUserAgent = options?.headers?.["User-Agent"] || null;
             return Promise.resolve({
               ok: true,
               status: 200,
@@ -572,6 +574,11 @@ describe("getUsageLimits claude data-age fields (stale + cached_at)", () => {
 
       assert.equal(result.claude.configured, true);
       assert.equal(result.claude.error, null);
+      assert.match(
+        observedUserAgent || "",
+        /^claude-code\//,
+        "the usage endpoint 429s any non-Claude-Code User-Agent",
+      );
       assert.equal(result.claude.stale, false, "a live read must be marked fresh");
       assert.ok(result.claude.cached_at, "live read must carry a cached_at stamp");
       const cachedMs = Date.parse(result.claude.cached_at);
