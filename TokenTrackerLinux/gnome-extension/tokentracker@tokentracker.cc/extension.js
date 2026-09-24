@@ -964,8 +964,10 @@ class TokenTrackerIndicator extends PanelMenu.Button {
         const url = `${BASE_URL}${path}${queryString({...params, tz, tz_offset_minutes: offset, account: 1})}`;
         const {message, json} = await this._send('GET', url);
         const fallback = message.response_headers.get_one('X-TokenTracker-Account-Fallback') ?? '';
-        if (fallback.trim().startsWith('transient') && this._accountCache.has(url))
-            return this._accountCache.get(url);
+        // Never cache a fallback itself, or it would freeze until the cloud
+        // read recovers.
+        if (fallback.trim().startsWith('transient'))
+            return this._accountCache.get(url) ?? json;
         this._accountCache.delete(url);
         this._accountCache.set(url, json);
         if (this._accountCache.size > ACCOUNT_CACHE_SIZE)
