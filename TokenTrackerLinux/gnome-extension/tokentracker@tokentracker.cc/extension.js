@@ -18,10 +18,18 @@ Gio._promisify(Soup.Session.prototype, 'send_and_read_async');
 // The Linux app pins its embedded server to this port (see server.rs).
 const BASE_URL = 'http://127.0.0.1:17680';
 const DESKTOP_ID = 'TokenTracker.desktop';
-const SUMMARY_REFRESH_SECONDS = 30;
+// With account=1, a signed-in user's summary read goes through to the cloud,
+// so the background poll matches the macOS app. Opening the menu fetches
+// right away.
+const REFRESH_SECONDS = 300;
+// While the app isn't running nothing leaves the machine, so notice it
+// starting sooner.
+const OFFLINE_RETRY_SECONDS = 30;
 // Limits hit provider APIs upstream; polling them as often as the summary
 // gets the user rate limited (Claude returns 429 within minutes).
 const LIMITS_REFRESH_SECONDS = 300;
+// Enough for every range the dropdown asks for in a day.
+const ACCOUNT_CACHE_SIZE = 32;
 const BLINK_EVERY_SECONDS = 5;
 const BLINK_MS = 140;
 
@@ -144,6 +152,12 @@ function limitColor(percent) {
     return [0.20, 0.72, 0.40];
 }
 
+// St.BoxLayout gained `orientation` in 48 and deprecated `vertical` after it;
+// 45-47 only have `vertical`.
+const VERTICAL = 'orientation' in St.BoxLayout.prototype
+    ? {orientation: Clutter.Orientation.VERTICAL}
+    : {vertical: true};
+
 function cssColor([r, g, b], alpha = 1) {
     return `rgba(${Math.round(r * 255)}, ${Math.round(g * 255)}, ${Math.round(b * 255)}, ${alpha})`;
 }
@@ -209,6 +223,18 @@ function localTimeZoneQuery() {
     }
     const offset = Math.round(now.get_utc_offset() / 60_000_000);
     return {tz, offset};
+}
+
+function isCancelled(error) {
+    return Boolean(error?.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED));
+}
+
+function queryString(params) {
+    const query = Object.entries(params)
+        .filter(([, v]) => v !== null && v !== undefined && v !== '')
+        .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+        .join('&');
+    return query ? `?${query}` : '';
 }
 
 function dayString(date) {
@@ -727,6 +753,9 @@ class TokenTrackerIndicator extends PanelMenu.Button {
         this._timeouts = [];
         this._limits = null;
         this._limitsFetchedAt = 0;
+        this._limitsLoading = false;
+        this._lastRefreshAt = 0;
+        this._accountCache = new Map();
         this._period = 'month';
         this._data = null;
         this._quipIndex = 0;
@@ -756,7 +785,10 @@ class TokenTrackerIndicator extends PanelMenu.Button {
             this._refresh();
         });
 
-        this._addTimeout(SUMMARY_REFRESH_SECONDS, () => this._refresh());
+        this._addTimeout(OFFLINE_RETRY_SECONDS, () => {
+            if (this._offline || Date.now() - this._lastRefreshAt >= REFRESH_SECONDS * 1000)
+                this._refresh();
+        });
         this._addTimeout(BLINK_EVERY_SECONDS, () => this._blink());
         this._refresh();
     }
@@ -782,7 +814,7 @@ class TokenTrackerIndicator extends PanelMenu.Button {
 
     _makeColumn(labelText) {
         const box = new St.BoxLayout({
-            vertical: true,
+            ...VERTICAL,
             style_class: 'tokentracker-column',
             y_align: Clutter.ActorAlign.CENTER,
         });
@@ -850,7 +882,7 @@ class TokenTrackerIndicator extends PanelMenu.Button {
             vscrollbar_policy: St.PolicyType.AUTOMATIC,
             overlay_scrollbars: true,
         });
-        this._content = new St.BoxLayout({vertical: true, x_expand: true, style_class: 'tokentracker-content'});
+        this._content = new St.BoxLayout({...VERTICAL, x_expand: true, style_class: 'tokentracker-content'});
         if ('child' in this._scroll)
             this._scroll.child = this._content;
         else
@@ -904,12 +936,8 @@ class TokenTrackerIndicator extends PanelMenu.Button {
         Gio.AppInfo.launch_default_for_uri(`${BASE_URL}/dashboard`, null);
     }
 
-    async _request(method, path, {params = {}, headers = {}, body = null} = {}) {
-        const query = Object.entries(params)
-            .filter(([, v]) => v !== null && v !== undefined && v !== '')
-            .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
-            .join('&');
-        const message = Soup.Message.new(method, `${BASE_URL}${path}${query ? `?${query}` : ''}`);
+    async _send(method, url, {headers = {}, body = null} = {}) {
+        const message = Soup.Message.new(method, url);
         for (const [k, v] of Object.entries(headers))
             message.request_headers.append(k, v);
         if (body !== null)
@@ -917,13 +945,32 @@ class TokenTrackerIndicator extends PanelMenu.Button {
         const bytes = await this._session.send_and_read_async(
             message, GLib.PRIORITY_DEFAULT, this._cancellable);
         if (message.get_status() !== Soup.Status.OK)
-            throw new Error(`HTTP ${message.get_status()} for ${path}`);
-        return JSON.parse(new TextDecoder().decode(bytes.get_data()));
+            throw new Error(`HTTP ${message.get_status()} for ${url.slice(BASE_URL.length).split('?')[0]}`);
+        return {message, json: JSON.parse(new TextDecoder().decode(bytes.get_data()))};
     }
 
-    _getJson(path, params) {
+    async _request(method, path, {params = {}, ...options} = {}) {
+        const {json} = await this._send(method, `${BASE_URL}${path}${queryString(params)}`, options);
+        return json;
+    }
+
+    // When the cloud read behind account=1 fails, the server still answers 200
+    // with this machine's data and marks it `transient-*`. Showing that would
+    // flip the numbers between account-wide and single-device totals, so keep
+    // the last account-wide answer for the same request (APIClient.swift and
+    // AccountViewSource.swift do the same on macOS).
+    async _getJson(path, params) {
         const {tz, offset} = localTimeZoneQuery();
-        return this._request('GET', path, {params: {...params, tz, tz_offset_minutes: offset, account: 1}});
+        const url = `${BASE_URL}${path}${queryString({...params, tz, tz_offset_minutes: offset, account: 1})}`;
+        const {message, json} = await this._send('GET', url);
+        const fallback = message.response_headers.get_one('X-TokenTracker-Account-Fallback') ?? '';
+        if (fallback.trim().startsWith('transient') && this._accountCache.has(url))
+            return this._accountCache.get(url);
+        this._accountCache.delete(url);
+        this._accountCache.set(url, json);
+        if (this._accountCache.size > ACCOUNT_CACHE_SIZE)
+            this._accountCache.delete(this._accountCache.keys().next().value);
+        return json;
     }
 
     // The header button runs a real sync, like the macOS popover's: the server
@@ -945,13 +992,14 @@ class TokenTrackerIndicator extends PanelMenu.Button {
                 body: '{}',
             });
         } catch (e) {
-            if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED)) return;
-            console.warn(`TokenTracker: sync failed: ${e}`);
-        } finally {
-            this._syncing = false;
-            this._syncIcon.remove_all_transitions();
-            this._syncIcon.rotation_angle_z = 0;
+            if (!isCancelled(e))
+                console.warn(`TokenTracker: sync failed: ${e}`);
         }
+        this._syncing = false;
+        // Disabling the extension mid-sync destroys the icon under us.
+        if (this._destroyed) return;
+        this._syncIcon.remove_all_transitions();
+        this._syncIcon.rotation_angle_z = 0;
         this._quipIndex++;
         await this._refresh({forceLimits: true});
     }
@@ -972,30 +1020,55 @@ class TokenTrackerIndicator extends PanelMenu.Button {
     }
 
     async _refresh({forceLimits = false} = {}) {
-        // A background poll may be mid-flight when the menu opens; rerun after
-        // it so the dropdown still gets its data.
+        if (this._destroyed) return;
+        // A background poll may be mid-flight when the menu opens or Sync is
+        // clicked; rerun after it, keeping any forced limits read.
         if (this._refreshing) {
             this._refreshAgain = true;
+            this._pendingForceLimits ||= forceLimits;
             return;
         }
         this._refreshing = true;
+        try {
+            await this._refreshOnce(forceLimits);
+        } finally {
+            this._refreshing = false;
+        }
+        if (!this._refreshAgain || this._destroyed) return;
+        const pending = this._pendingForceLimits;
+        this._refreshAgain = false;
+        this._pendingForceLimits = false;
+        await this._refresh({forceLimits: pending});
+    }
+
+    async _refreshOnce(forceLimits) {
+        this._lastRefreshAt = Date.now();
         const today = dayString(new Date());
 
+        // Only the today summary decides whether the app is reachable.
+        let todaySummary;
         try {
-            const todaySummary = await this._getJson('/functions/tokentracker-usage-summary', {from: today, to: today});
-            this._offline = false;
-            this._clawd.opacity = 255;
-            this._tokensColumn.value.text = formatCompact(todaySummary.totals?.total_tokens);
-            this._costColumn.value.text = formatCost(todaySummary.totals?.total_cost_usd);
-            this._setStatsVisible(true);
+            todaySummary = await this._getJson('/functions/tokentracker-usage-summary', {from: today, to: today});
+        } catch (e) {
+            if (!isCancelled(e))
+                this._setOffline(e);
+            return;
+        }
+        this._offline = false;
+        this._clawd.opacity = 255;
+        this._tokensColumn.value.text = formatCompact(todaySummary.totals?.total_tokens);
+        this._costColumn.value.text = formatCost(todaySummary.totals?.total_cost_usd);
+        this._setStatsVisible(true);
 
-            // The rest only feeds the dropdown; skip it while the menu is closed.
-            if (!this.menu.isOpen) return;
+        // The rest only feeds the dropdown; skip it while the menu is closed.
+        if (!this.menu.isOpen) return;
 
-            const now = new Date();
-            const dailyFrom = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 29);
-            const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-            const period = this._period;
+        const now = new Date();
+        const dailyFrom = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 29);
+        const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+        const period = this._period;
+        let dropdown;
+        try {
             const [totalSummary, daily, heatmap, periodData] = await Promise.all([
                 this._getJson('/functions/tokentracker-usage-summary', rangeForPeriod('total')),
                 this._getJson('/functions/tokentracker-usage-daily', {
@@ -1005,37 +1078,45 @@ class TokenTrackerIndicator extends PanelMenu.Button {
                 this._getJson('/functions/tokentracker-usage-heatmap', {weeks: 52}),
                 this._fetchPeriodData(period),
             ]);
-
-            const limitsStale = Date.now() - this._limitsFetchedAt > LIMITS_REFRESH_SECONDS * 1000;
-            if (forceLimits || limitsStale) {
-                try {
-                    this._limits = await this._request('GET', '/functions/tokentracker-usage-limits');
-                    this._limitsFetchedAt = Date.now();
-                } catch (e) {
-                    if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED)) throw e;
-                }
-            }
-
-            if (period !== this._period) return;
-            this._data = {todaySummary, totalSummary, daily, heatmap, ...periodData};
-            this._renderDashboard();
+            dropdown = {totalSummary, daily, heatmap, ...periodData};
         } catch (e) {
-            if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED)) return;
-            if (!this._offline)
-                console.warn(`TokenTracker: refresh failed: ${e}\n${e.stack ?? ''}`);
-            this._offline = true;
-            this._data = null;
-            this._clawd.opacity = 128;
-            this._clawd.setEyesClosed(false);
-            this._setStatsVisible(false);
-            this._renderMessage('TokenTracker isn’t running. Open the app to start tracking.');
-        } finally {
-            this._refreshing = false;
+            if (isCancelled(e)) return;
+            console.warn(`TokenTracker: dashboard fetch failed: ${e}`);
+            // Keep an already rendered dashboard; the top bar is still live.
+            if (!this._data)
+                this._renderMessage('Couldn’t load the dashboard. Try Sync or open the app.');
+            return;
         }
-        if (this._refreshAgain) {
-            this._refreshAgain = false;
-            await this._refresh({forceLimits});
+
+        if (period !== this._period) return;
+        this._data = {todaySummary, ...dropdown};
+
+        // Limits can take ~20s; show the usage first and fill them in after.
+        const limitsStale = Date.now() - this._limitsFetchedAt > LIMITS_REFRESH_SECONDS * 1000;
+        this._limitsLoading = forceLimits || limitsStale;
+        this._renderDashboard();
+        if (!this._limitsLoading) return;
+        try {
+            this._limits = await this._request('GET', '/functions/tokentracker-usage-limits');
+            this._limitsFetchedAt = Date.now();
+        } catch (e) {
+            if (isCancelled(e)) return;
+            console.warn(`TokenTracker: limits fetch failed: ${e}`);
         }
+        this._limitsLoading = false;
+        if (this._data && this.menu.isOpen)
+            this._renderDashboard();
+    }
+
+    _setOffline(error) {
+        if (!this._offline)
+            console.warn(`TokenTracker: refresh failed: ${error}\n${error.stack ?? ''}`);
+        this._offline = true;
+        this._data = null;
+        this._clawd.opacity = 128;
+        this._clawd.setEyesClosed(false);
+        this._setStatsVisible(false);
+        this._renderMessage('TokenTracker isn’t running. Open the app to start tracking.');
     }
 
     async _setPeriod(period) {
@@ -1048,7 +1129,7 @@ class TokenTrackerIndicator extends PanelMenu.Button {
             Object.assign(this._data, periodData);
             this._renderDashboard();
         } catch (e) {
-            if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+            if (!isCancelled(e))
                 console.warn(`TokenTracker: period fetch failed: ${e}`);
         }
     }
@@ -1112,8 +1193,10 @@ class TokenTrackerIndicator extends PanelMenu.Button {
         this._content.add_child(cards);
 
         const limits = limitRows(this._limits);
-        if (limits.length > 0) {
-            const {section} = this._section('Limits');
+        if (limits.length > 0 || this._limitsLoading) {
+            const {section, trailing} = this._section('Limits');
+            if (this._limitsLoading)
+                trailing.add_child(new St.Label({text: 'Updating…', style_class: 'tokentracker-hint'}));
             for (const row of limits)
                 section.add_child(this._limitRow(row));
             this._content.add_child(section);
@@ -1136,7 +1219,7 @@ class TokenTrackerIndicator extends PanelMenu.Button {
     }
 
     _card(title, value, subtitle) {
-        const card = new St.BoxLayout({vertical: true, style_class: 'tokentracker-card', x_expand: true});
+        const card = new St.BoxLayout({...VERTICAL, style_class: 'tokentracker-card', x_expand: true});
         card.add_child(new St.Label({text: title, style_class: 'tokentracker-card-title'}));
         card.add_child(new St.Label({text: value, style_class: 'tokentracker-card-value'}));
         card.add_child(new St.Label({text: subtitle, style_class: 'tokentracker-card-subtitle'}));
@@ -1145,7 +1228,7 @@ class TokenTrackerIndicator extends PanelMenu.Button {
 
     // SharedComponents.swift SectionHeader: uppercase caption, trailing slot.
     _section(title) {
-        const section = new St.BoxLayout({vertical: true, style_class: 'tokentracker-section', x_expand: true});
+        const section = new St.BoxLayout({...VERTICAL, style_class: 'tokentracker-section', x_expand: true});
         const header = new St.BoxLayout({x_expand: true});
         header.add_child(new St.Label({
             text: title.toUpperCase(),
@@ -1220,7 +1303,7 @@ class TokenTrackerIndicator extends PanelMenu.Button {
     }
 
     _limitRow({name, label, percent, reset}) {
-        const row = new St.BoxLayout({vertical: true, style_class: 'tokentracker-limit', x_expand: true});
+        const row = new St.BoxLayout({...VERTICAL, style_class: 'tokentracker-limit', x_expand: true});
         const header = new St.BoxLayout({x_expand: true});
         header.add_child(new St.Label({text: `${name} · ${label}`, style_class: 'tokentracker-limit-name', x_expand: true}));
         const pct = `${Math.round(percent)}%`;
@@ -1253,6 +1336,7 @@ class TokenTrackerIndicator extends PanelMenu.Button {
     }
 
     destroy() {
+        this._destroyed = true;
         this._cancellable.cancel();
         this._session.abort();
         for (const id of this._timeouts)

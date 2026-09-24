@@ -8,14 +8,20 @@ link to the dashboard.
 
 It reads everything from the Linux desktop app's local server on
 `127.0.0.1:17680`, so the app has to be running. It sends nothing anywhere
-else.
+else. If something else holds 17680 when the app starts, the app falls back
+to a random port and the extension shows "TokenTracker isn't running". Free
+the port and restart the app.
 
-Supports GNOME Shell 45–48. Tested on 46 (Ubuntu 24.04, Wayland). Styled
-for the dark shell theme.
+Community-maintained: the core team has no GNOME setup to test on, so
+report problems with your GNOME version. `metadata.json` lists 45–50.
+Tested on 46 (Ubuntu 24.04, Wayland), and on 49 (Fedora 43) and 50
+(Fedora 44) in headless shells; 45, 47 and 48 are untested. Styled for the
+dark shell theme.
 
 ## Install from a checkout
 
 ```bash
+mkdir -p ~/.local/share/gnome-shell/extensions
 ln -s "$PWD/TokenTrackerLinux/gnome-extension/tokentracker@tokentracker.cc" \
   ~/.local/share/gnome-shell/extensions/tokentracker@tokentracker.cc
 ```
