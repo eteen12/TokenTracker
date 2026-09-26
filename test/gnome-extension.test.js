@@ -30,3 +30,12 @@ test("GNOME extension metadata matches its directory and lists shell versions", 
     assert.match(version, /^\d+$/);
   }
 });
+
+test("GNOME extension rejects a 200 whose JSON body is not an object", () => {
+  // `null` parses fine; without this check `todaySummary.totals` threw outside
+  // the refresh's catch instead of showing the load-failure state.
+  const source = fs.readFileSync(path.join(extensionDir, "extension.js"), "utf8");
+  const send = source.slice(source.indexOf("async _send("), source.indexOf("async _request("));
+  assert.match(send, /json === null \|\| typeof json !== 'object'/);
+  assert.match(send, /throw new ServerError\(`Unexpected response from/);
+});

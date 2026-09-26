@@ -953,11 +953,18 @@ class TokenTrackerIndicator extends PanelMenu.Button {
         const path = url.slice(BASE_URL.length).split('?')[0];
         if (message.get_status() !== Soup.Status.OK)
             throw new ServerError(`HTTP ${message.get_status()} for ${path}`);
+        let json;
         try {
-            return {message, json: JSON.parse(new TextDecoder().decode(bytes.get_data()))};
+            json = JSON.parse(new TextDecoder().decode(bytes.get_data()));
         } catch (e) {
             throw new ServerError(`Bad JSON from ${path}: ${e.message}`);
         }
+        // Every endpoint answers with an object. A 200 carrying `null` or a bare
+        // value would parse fine and then throw outside the callers' catch, so
+        // treat it like any other bad response.
+        if (json === null || typeof json !== 'object')
+            throw new ServerError(`Unexpected response from ${path}`);
+        return {message, json};
     }
 
     async _request(method, path, {params = {}, ...options} = {}) {
