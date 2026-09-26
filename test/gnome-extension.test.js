@@ -31,11 +31,24 @@ test("GNOME extension metadata matches its directory and lists shell versions", 
   }
 });
 
-test("GNOME extension rejects a 200 whose JSON body is not an object", () => {
-  // `null` parses fine; without this check `todaySummary.totals` threw outside
-  // the refresh's catch instead of showing the load-failure state.
+// extension.js imports gi:// modules, so load just the response validator
+// (and the error class it throws) out of the source and run it for real.
+function loadResponseValidator() {
   const source = fs.readFileSync(path.join(extensionDir, "extension.js"), "utf8");
-  const send = source.slice(source.indexOf("async _send("), source.indexOf("async _request("));
-  assert.match(send, /json === null \|\| typeof json !== 'object'/);
-  assert.match(send, /throw new ServerError\(`Unexpected response from/);
+  const cls = source.match(/^class ServerError extends Error \{\}$/m);
+  const start = source.indexOf("function parseJsonObject(");
+  const end = source.indexOf("\n}\n", start) + 2;
+  assert.ok(cls && start >= 0 && end > start, "parseJsonObject / ServerError not found");
+  return new Function(`${cls[0]}\n${source.slice(start, end)}\nreturn { ServerError, parseJsonObject };`)();
+}
+
+test("GNOME extension treats unusable JSON bodies as server errors", () => {
+  const { ServerError, parseJsonObject } = loadResponseValidator();
+  // `null` used to throw outside the refresh's catch; `[]` rendered as 0 / $0.
+  for (const body of ["null", "[]", "[{\"totals\":{}}]", "42", "\"ok\"", "true", "{not json"]) {
+    assert.throws(() => parseJsonObject(body, "/functions/x"), ServerError, body);
+  }
+  assert.deepEqual(parseJsonObject('{"totals":{"total_tokens":5}}', "/functions/x"), {
+    totals: { total_tokens: 5 },
+  });
 });

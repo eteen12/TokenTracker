@@ -229,6 +229,21 @@ function localTimeZoneQuery() {
 // (refused, timed out) means the app isn't running.
 class ServerError extends Error {}
 
+// Every endpoint answers with a JSON object. A 200 carrying `null`, an array or
+// a bare value would parse fine and then either throw outside the callers'
+// catch or render as zeros, so treat it like any other bad response.
+function parseJsonObject(text, path) {
+    let json;
+    try {
+        json = JSON.parse(text);
+    } catch (e) {
+        throw new ServerError(`Bad JSON from ${path}: ${e.message}`);
+    }
+    if (json === null || typeof json !== 'object' || Array.isArray(json))
+        throw new ServerError(`Unexpected response from ${path}`);
+    return json;
+}
+
 const LOAD_FAILED_MESSAGE = 'Couldn’t load the dashboard. Try Sync or open the app.';
 
 function isCancelled(error) {
@@ -953,17 +968,7 @@ class TokenTrackerIndicator extends PanelMenu.Button {
         const path = url.slice(BASE_URL.length).split('?')[0];
         if (message.get_status() !== Soup.Status.OK)
             throw new ServerError(`HTTP ${message.get_status()} for ${path}`);
-        let json;
-        try {
-            json = JSON.parse(new TextDecoder().decode(bytes.get_data()));
-        } catch (e) {
-            throw new ServerError(`Bad JSON from ${path}: ${e.message}`);
-        }
-        // Every endpoint answers with an object. A 200 carrying `null` or a bare
-        // value would parse fine and then throw outside the callers' catch, so
-        // treat it like any other bad response.
-        if (json === null || typeof json !== 'object')
-            throw new ServerError(`Unexpected response from ${path}`);
+        const json = parseJsonObject(new TextDecoder().decode(bytes.get_data()), path);
         return {message, json};
     }
 
