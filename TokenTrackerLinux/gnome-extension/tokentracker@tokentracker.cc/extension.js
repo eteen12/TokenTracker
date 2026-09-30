@@ -32,6 +32,7 @@ const LIMITS_REFRESH_SECONDS = 300;
 const ACCOUNT_CACHE_SIZE = 32;
 const BLINK_EVERY_SECONDS = 5;
 const BLINK_MS = 140;
+const PLACEHOLDER = '–';
 
 // Clawd, in clawd-static-base.svg units, mapped onto a 22x22 canvas with the
 // same constants as MenuBarAnimator.swift so both platforms draw one shape.
@@ -226,19 +227,30 @@ function localTimeZoneQuery() {
 }
 
 // The server answered, just not with usable data. Only a transport failure
-// (refused, timed out) means the app isn't running.
+// (refused, timed out) or a reply from something that isn't the app means the
+// app isn't running.
 class ServerError extends Error {}
 
-// Every endpoint answers with a JSON object. A 200 carrying `null`, an array or
-// a bare value would parse fine and then either throw outside the callers'
-// catch or render as zeros, so treat it like any other bad response.
-function parseJsonObject(text, path) {
+// The app answers every endpoint, always with JSON, so a 404 or a non-JSON
+// body comes from some other service holding the port.
+class ForeignServerError extends Error {}
+
+// A 200 carrying `null`, an array or a bare value would parse fine and then
+// either throw outside the callers' catch or render as zeros, so treat it like
+// any other bad response.
+function parseResponse(status, text, path) {
+    if (status === 404)
+        throw new ForeignServerError(`HTTP 404 for ${path}`);
+    if (status >= 500)
+        throw new ServerError(`HTTP ${status} for ${path}`);
     let json;
     try {
         json = JSON.parse(text);
     } catch (e) {
-        throw new ServerError(`Bad JSON from ${path}: ${e.message}`);
+        throw new ForeignServerError(`Not JSON from ${path}: ${e.message}`);
     }
+    if (status !== 200)
+        throw new ServerError(`HTTP ${status} for ${path}`);
     if (json === null || typeof json !== 'object' || Array.isArray(json))
         throw new ServerError(`Unexpected response from ${path}`);
     return json;
@@ -839,7 +851,7 @@ class TokenTrackerIndicator extends PanelMenu.Button {
             style_class: 'tokentracker-column',
             y_align: Clutter.ActorAlign.CENTER,
         });
-        const value = new St.Label({style_class: 'tokentracker-value', x_align: Clutter.ActorAlign.CENTER});
+        const value = new St.Label({text: PLACEHOLDER, style_class: 'tokentracker-value', x_align: Clutter.ActorAlign.CENTER});
         const label = new St.Label({
             text: labelText,
             style_class: 'tokentracker-label',
@@ -966,9 +978,7 @@ class TokenTrackerIndicator extends PanelMenu.Button {
         const bytes = await this._session.send_and_read_async(
             message, GLib.PRIORITY_DEFAULT, this._cancellable);
         const path = url.slice(BASE_URL.length).split('?')[0];
-        if (message.get_status() !== Soup.Status.OK)
-            throw new ServerError(`HTTP ${message.get_status()} for ${path}`);
-        const json = parseJsonObject(new TextDecoder().decode(bytes.get_data()), path);
+        const json = parseResponse(message.get_status(), new TextDecoder().decode(bytes.get_data()), path);
         return {message, json};
     }
 
@@ -1145,6 +1155,7 @@ class TokenTrackerIndicator extends PanelMenu.Button {
     _setServerError(error) {
         console.warn(`TokenTracker: refresh failed: ${error}`);
         this._setOnline();
+        this._setStatsVisible(true);
         // A closed menu refetches when opened; don't leave an error to flash.
         if (!this._data)
             this._renderMessage(this.menu.isOpen ? LOAD_FAILED_MESSAGE : 'Loading…');
@@ -1158,6 +1169,10 @@ class TokenTrackerIndicator extends PanelMenu.Button {
         this._clawd.opacity = 128;
         this._clawd.setEyesClosed(false);
         this._setStatsVisible(false);
+        // Numbers from before the app went away shouldn't reappear next to a
+        // server error.
+        this._tokensColumn.value.text = PLACEHOLDER;
+        this._costColumn.value.text = PLACEHOLDER;
         this._renderMessage('TokenTracker isn’t running. Open the app to start tracking.');
     }
 
